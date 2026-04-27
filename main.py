@@ -6,6 +6,7 @@ import requests
 import time
 import datetime
 import threading
+import pytz
 from flask import Flask
 
 TOKEN = os.getenv("TOKEN")
@@ -25,14 +26,33 @@ def send_message(text):
     for i in range(3):
         try:
             response = requests.post(url, data=data, timeout=20)
+
             if response.status_code == 200:
                 print("📩 텔레그램 전송 성공")
                 return True
             else:
                 print("❌ 텔레그램 응답 오류:", response.text)
+
         except Exception as e:
-            print(f"❌ 전송 실패 {i+1}/3", e)
+            print(f"❌ 전송 실패 {i + 1}/3", e)
             time.sleep(3)
+
+    return False
+
+
+def is_market_open():
+    ny = pytz.timezone("America/New_York")
+    now_ny = datetime.datetime.now(ny)
+
+    weekday = now_ny.weekday()
+    hour = now_ny.hour
+    minute = now_ny.minute
+
+    if weekday >= 5:
+        return False
+
+    if (hour > 9 or (hour == 9 and minute >= 30)) and hour < 16:
+        return True
 
     return False
 
@@ -64,6 +84,7 @@ CHUNK_SIZE = 50
 sent_today = set()
 last_day = datetime.date.today()
 market_block_alerted = False
+market_was_open = None
 
 
 def is_market_ok():
@@ -204,99 +225,117 @@ RSI: {round(rsi_now, 2)}
 
 
 def run_stock_bot():
-    global last_day, market_block_alerted
+    global last_day, market_block_alerted, market_was_open
 
     print("🚀 주식 알림 봇 시작")
+    send_message("✅ 주식 알림 봇이 시작되었습니다.")
 
     while True:
-        now = datetime.datetime.now()
+        try:
+            today = datetime.date.today()
 
-        if not (now.hour >= 22 or now.hour <= 5):
-            print("⏰ 장외시간")
-            time.sleep(CHECK_INTERVAL)
-            continue
+            if today != last_day:
+                sent_today.clear()
+                market_block_alerted = False
+                last_day = today
 
-        today = datetime.date.today()
+            market_open = is_market_open()
 
-        if today != last_day:
-            sent_today.clear()
-            market_block_alerted = False
-            last_day = today
+            if market_was_open is None:
+                market_was_open = market_open
 
-        print("🔄 검사 시작")
+            if market_open and market_was_open is False:
+                send_message("🟢 미국 장 시작")
+                market_was_open = True
 
-        if not is_market_ok():
-            print("🚫 하락장 → 매매 금지")
+            if not market_open and market_was_open is True:
+                send_message("🔴 미국 장 종료")
+                market_was_open = False
 
-            if not market_block_alerted:
-                send_message("🚫 하락장 감지 → 매매 중지")
-                market_block_alerted = True
-
-            time.sleep(CHECK_INTERVAL)
-            continue
-
-        results = []
-
-        for group in chunks(leverage_stocks, CHUNK_SIZE):
-            data_all = download_group(group)
-
-            if data_all is None or data_all.empty:
+            if not market_open:
+                print("⏰ 장외시간 (미국 뉴욕 기준)")
+                time.sleep(CHECK_INTERVAL)
                 continue
 
-            for stock in group:
-                try:
-                    data = data_all[stock].copy()
+            print("🔄 검사 시작")
 
-                    if is_buy_timing(data, "leverage") and stock not in sent_today:
-                        msg = make_message(
-                            stock_type_label="레버리지",
-                            stock=stock,
-                            data=data,
-                            stop_rate=0.97,
-                            target_rate=1.05
-                        )
+            if not is_market_ok():
+                print("🚫 하락장 → 매매 금지")
 
-                        results.append(msg)
-                        sent_today.add(stock)
+                if not market_block_alerted:
+                    send_message("🚫 하락장 감지 → 매매 중지")
+                    market_block_alerted = True
 
-                except Exception as e:
-                    print(f"{stock} 처리 오류:", e)
-                    continue
-
-        for group in chunks(normal_stocks, CHUNK_SIZE):
-            data_all = download_group(group)
-
-            if data_all is None or data_all.empty:
+                time.sleep(CHECK_INTERVAL)
                 continue
 
-            for stock in group:
-                try:
-                    data = data_all[stock].copy()
+            results = []
 
-                    if is_buy_timing(data, "normal") and stock not in sent_today:
-                        msg = make_message(
-                            stock_type_label="일반",
-                            stock=stock,
-                            data=data,
-                            stop_rate=0.96,
-                            target_rate=1.06
-                        )
+            for group in chunks(leverage_stocks, CHUNK_SIZE):
+                data_all = download_group(group)
 
-                        results.append(msg)
-                        sent_today.add(stock)
-
-                except Exception as e:
-                    print(f"{stock} 처리 오류:", e)
+                if data_all is None or data_all.empty:
                     continue
 
-        if results:
-            message = "🔥 매수 타이밍 알림\n\n" + "\n".join(results)
-            send_message(message)
-        else:
-            print("신호 없음")
+                for stock in group:
+                    try:
+                        data = data_all[stock].copy()
 
-        print("⏱ 5분 대기...\n")
-        time.sleep(CHECK_INTERVAL)
+                        if is_buy_timing(data, "leverage") and stock not in sent_today:
+                            msg = make_message(
+                                stock_type_label="레버리지",
+                                stock=stock,
+                                data=data,
+                                stop_rate=0.97,
+                                target_rate=1.05
+                            )
+
+                            results.append(msg)
+                            sent_today.add(stock)
+
+                    except Exception as e:
+                        print(f"{stock} 처리 오류:", e)
+                        continue
+
+            for group in chunks(normal_stocks, CHUNK_SIZE):
+                data_all = download_group(group)
+
+                if data_all is None or data_all.empty:
+                    continue
+
+                for stock in group:
+                    try:
+                        data = data_all[stock].copy()
+
+                        if is_buy_timing(data, "normal") and stock not in sent_today:
+                            msg = make_message(
+                                stock_type_label="일반",
+                                stock=stock,
+                                data=data,
+                                stop_rate=0.96,
+                                target_rate=1.06
+                            )
+
+                            results.append(msg)
+                            sent_today.add(stock)
+
+                    except Exception as e:
+                        print(f"{stock} 처리 오류:", e)
+                        continue
+
+            if results:
+                message = "🔥 매수 타이밍 알림\n\n" + "\n".join(results)
+                send_message(message)
+            else:
+                print("신호 없음")
+
+            print("⏱ 5분 대기...\n")
+            time.sleep(CHECK_INTERVAL)
+
+        except Exception as e:
+            print("전체 루프 오류:", e)
+            send_message(f"⚠️ 봇 오류 발생: {e}")
+            time.sleep(CHECK_INTERVAL)
 
 
 if __name__ == "__main__":
